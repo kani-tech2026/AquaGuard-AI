@@ -1,0 +1,81 @@
+/* =========================
+   AQUAGUARD AI - INDEX CSS
+   ========================= */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  min-width: 100%;
+  min-height: 100%;
+}
+
+html {
+  background: #061014;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background: #061014;
+  color: #e8f7f5;
+  font-family: Inter, Arial, Helvetica, sans-serif;
+  overflow-x: hidden;
+}
+
+#root {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  border: none;
+  text-align: left;
+  min-height: 100vh;
+}
+
+/* Remove Vite default heading styles */
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+p {
+  margin-top: 0;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+p,
+span,
+div,
+label {
+  color: inherit;
+}
+
+button,
+input,
+textarea,
+select {
+  font-family: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+/* Prevent images from overflowing */
+
+img {
+  max-width: 100%;
+}

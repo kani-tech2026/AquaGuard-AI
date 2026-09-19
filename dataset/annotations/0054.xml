@@ -1,0 +1,27 @@
+<?xml version='1.0' encoding='utf8'?>
+<annotation>
+	<folder>img</folder>
+	<filename>2022-07-20-4547.jpg</filename>
+	<path>E:\BaiduNetdiskDownload\minkai\minkai\img\2022-07-20-4547.jpg</path>
+	<source>
+		<database>Unknown</database>
+	</source>
+	<size>
+		<width>880</width>
+		<height>1920</height>
+		<depth>3</depth>
+	</size>
+	<segmented>0</segmented>
+	<object>
+		<name>floater</name>
+		<pose>Unspecified</pose>
+		<truncated>0</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>333</xmin>
+			<ymin>1156</ymin>
+			<xmax>538</xmax>
+			<ymax>1431</ymax>
+		</bndbox>
+	</object>
+</annotation>

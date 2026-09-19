@@ -1,0 +1,27 @@
+<?xml version='1.0' encoding='utf8'?>
+<annotation>
+	<folder>img</folder>
+	<filename>rubbish-2536.jpg</filename>
+	<path>D:\Allpackage\Label\img\rubbish-2536.jpg</path>
+	<source>
+		<database>Unknown</database>
+	</source>
+	<size>
+		<width>1920</width>
+		<height>1080</height>
+		<depth>3</depth>
+	</size>
+	<segmented>0</segmented>
+	<object>
+		<name>floater</name>
+		<pose>Unspecified</pose>
+		<truncated>0</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>1283</xmin>
+			<ymin>931</ymin>
+			<xmax>1697</xmax>
+			<ymax>1079</ymax>
+		</bndbox>
+	</object>
+</annotation>

@@ -1,0 +1,8 @@
+path: C:/Users/Admin/Desktop/AquaGuard-AI/dataset/yolo
+
+train: train/images
+val: val/images
+test: test/images
+
+names:
+  0: floater

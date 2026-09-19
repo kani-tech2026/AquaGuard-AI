@@ -1,0 +1,8 @@
+path: C:/Users/Admin/Desktop/AquaGuard-AI/dataset
+
+train: images
+val: images
+test: images
+
+names:
+  0: floater
