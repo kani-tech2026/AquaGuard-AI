@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from "react";
+import "leaflet/dist/leaflet.css";
+import { MapContainer, TileLayer, Marker, Popup } from "react-leaflet";
 import {
   Activity,
   AlertTriangle,
@@ -14,20 +16,75 @@ import {
 
 import "./App.css";
 
-const API = "http://127.0.0.1:8000";
+const API = import.meta.env.DEV
+  ? ""
+  : import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+
+function SourceTrackingMap({ latitude, longitude, plasticCount }) {
+  const position = [latitude, longitude];
+
+  return (
+    <div
+      style={{
+        height: "420px",
+        width: "100%",
+        borderRadius: "16px",
+        overflow: "hidden",
+      }}
+    >
+      <MapContainer
+        center={position}
+        zoom={15}
+        scrollWheelZoom={true}
+        style={{ height: "100%", width: "100%" }}
+      >
+        <TileLayer
+          attribution="&copy; OpenStreetMap contributors"
+          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+        />
+
+        <Marker position={position}>
+          <Popup>
+            <strong>AquaGuard AI</strong>
+            <br />
+            Plastic Hotspot
+            <br />
+            Plastic Count: {plasticCount}
+            <br />
+            Latitude: {latitude}
+            <br />
+            Longitude: {longitude}
+          </Popup>
+        </Marker>
+      </MapContainer>
+    </div>
+  );
+}
 
 function App() {
   const [file, setFile] = useState(null);
+  const [videoResult, setVideoResult] = useState(null);
   const [preview, setPreview] = useState(null);
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [history, setHistory] = useState([]);
   const [environment, setEnvironment] = useState(null);
   const [cameraOnline, setCameraOnline] = useState(false);
-  const [cameraTick, setCameraTick] = useState(Date.now());
+  const [cameraStarting, setCameraStarting] = useState(false);
+  const [cameraError, setCameraError] = useState("");
+  const [cameraDetections, setCameraDetections] = useState([]);
+  const [cameraFrameSize, setCameraFrameSize] = useState({
+    width: 0,
+    height: 0,
+  });
+  const [cameraDetectionError, setCameraDetectionError] = useState("");
+  const [videoError, setVideoError] = useState("");
   const [municipalityStatus, setMunicipalityStatus] = useState("standby");
+  const [notificationResults, setNotificationResults] = useState(null);
   const [voiceEnabled, setVoiceEnabled] = useState(true);
   const lastAlertRef = useRef(null);
+  const cameraStreamRef = useRef(null);
+  const videoRef = useRef(null);
   const [imageSize, setImageSize] = useState({
     width: 1,
     height: 1,
@@ -37,22 +94,177 @@ function App() {
     loadHistory();
     loadEnvironment();
 
-    const cameraTimer = window.setInterval(() => {
-      setCameraTick(Date.now());
-      checkCamera();
-    }, 3000);
-
-    checkCamera();
-    return () => window.clearInterval(cameraTimer);
+    return () => {
+      cameraStreamRef.current?.getTracks().forEach((track) => track.stop());
+    };
   }, []);
 
-  const checkCamera = async () => {
-    try {
-      const response = await fetch(`${API}/api/camera?tick=${Date.now()}`);
-      setCameraOnline(response.ok && response.headers.get("content-type")?.includes("image"));
-    } catch {
-      setCameraOnline(false);
+  useEffect(() => {
+    if (!cameraOnline) {
+      return undefined;
     }
+
+    let active = true;
+    let timeoutId;
+
+    const analyzeFrame = async () => {
+      const video = videoRef.current;
+      if (!video || video.readyState < 2 || !video.videoWidth) {
+        if (active) {
+          timeoutId = window.setTimeout(analyzeFrame, 300);
+        }
+        return;
+      }
+
+      try {
+        const canvas = document.createElement("canvas");
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        const context = canvas.getContext("2d");
+        if (!context) {
+          throw new Error("Unable to prepare a camera frame for detection.");
+        }
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        const frame = await new Promise((resolve, reject) => {
+          canvas.toBlob(
+            (blob) => {
+              if (blob) {
+                resolve(blob);
+              } else {
+                reject(new Error("Unable to capture a camera frame."));
+              }
+            },
+            "image/jpeg",
+            0.85,
+          );
+        });
+        if (!active) return;
+
+        const formData = new FormData();
+        formData.append("file", frame, "camera-frame.jpg");
+        const response = await fetch(`${API}/api/detect-frame`, {
+          method: "POST",
+          body: formData,
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.detail || `Detection failed (${response.status}).`);
+        }
+
+        if (active) {
+          setCameraDetections(data.detections ?? []);
+          setCameraFrameSize(data.frame_size ?? {
+            width: canvas.width,
+            height: canvas.height,
+          });
+          setCameraDetectionError("");
+        }
+      } catch (error) {
+        if (active) {
+          console.error("Live camera detection error:", error);
+          setCameraDetectionError(
+            error.message || "Live camera detection failed.",
+          );
+        }
+      } finally {
+        if (active) {
+          timeoutId = window.setTimeout(analyzeFrame, 1000);
+        }
+      }
+    };
+
+    analyzeFrame();
+    return () => {
+      active = false;
+      window.clearTimeout(timeoutId);
+    };
+  }, [cameraOnline]);
+
+  const startCamera = async () => {
+    setCameraError("");
+    setCameraDetections([]);
+    setCameraFrameSize({ width: 0, height: 0 });
+    setCameraDetectionError("");
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setCameraError("This browser does not support webcam access.");
+      return;
+    }
+
+    setCameraStarting(true);
+    let stream;
+
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { facingMode: { ideal: "environment" } },
+      });
+      cameraStreamRef.current = stream;
+
+      const videoTrack = stream.getVideoTracks()[0];
+      videoTrack.addEventListener(
+        "ended",
+        () => {
+          if (cameraStreamRef.current === stream) {
+            cameraStreamRef.current = null;
+            setCameraOnline(false);
+            setCameraDetections([]);
+            setCameraFrameSize({ width: 0, height: 0 });
+            setCameraError("The camera was disconnected.");
+          }
+        },
+        { once: true },
+      );
+
+      const video = videoRef.current;
+      if (!video) {
+        throw new Error("The camera preview is not available.");
+      }
+      video.srcObject = stream;
+      await video.play();
+
+      if (cameraStreamRef.current !== stream) {
+        return;
+      }
+      setCameraOnline(true);
+    } catch (error) {
+      if (cameraStreamRef.current === stream) {
+        cameraStreamRef.current = null;
+        if (videoRef.current?.srcObject === stream) {
+          videoRef.current.srcObject = null;
+        }
+        stream?.getTracks().forEach((track) => track.stop());
+      }
+
+      if (error.name === "AbortError") {
+        return;
+      }
+
+      console.error("Camera error:", error);
+
+      if (error.name === "NotAllowedError" || error.name === "SecurityError") {
+        setCameraError("Allow camera access in your browser to start the live feed.");
+      } else if (error.name === "NotFoundError") {
+        setCameraError("No camera was found on this device.");
+      } else {
+        setCameraError(error.message || "Unable to start the camera.");
+      }
+    } finally {
+      setCameraStarting(false);
+    }
+  };
+
+  const stopCamera = () => {
+    const stream = cameraStreamRef.current;
+    cameraStreamRef.current = null;
+    if (videoRef.current?.srcObject === stream) {
+      videoRef.current.srcObject = null;
+    }
+    stream?.getTracks().forEach((track) => track.stop());
+    setCameraOnline(false);
+    setCameraError("");
+    setCameraDetections([]);
   };
 
   const speakAlert = (message) => {
@@ -62,6 +274,26 @@ function App() {
     announcement.lang = "en-IN";
     announcement.rate = 0.92;
     window.speechSynthesis.speak(announcement);
+  };
+
+  const updateNotificationStatus = (alert) => {
+    setNotificationResults(alert?.notification ?? null);
+    if (!alert?.required) {
+      setMunicipalityStatus("standby");
+      return;
+    }
+
+    const channelStatuses = Object.values(alert.notification ?? {}).map(
+      (channel) => channel.status,
+    );
+
+    if (channelStatuses.includes("accepted")) {
+      setMunicipalityStatus("accepted");
+    } else if (channelStatuses.includes("failed")) {
+      setMunicipalityStatus("failed");
+    } else {
+      setMunicipalityStatus("setup");
+    }
   };
 
   const loadHistory = async () => {
@@ -126,26 +358,45 @@ function App() {
         body: formData,
       });
 
-      if (!response.ok) {
-        throw new Error(`Server error: ${response.status}`);
+      const responseBody = await response.text();
+      let data;
+      try {
+        data = responseBody ? JSON.parse(responseBody) : {};
+      } catch {
+        if (!response.ok) {
+          throw new Error(
+            `Image detection failed (${response.status}): ${
+              responseBody || response.statusText
+            }`,
+          );
+        }
+        throw new Error("The backend returned an invalid image response.");
       }
-
-      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(
+          data.detail || `Image detection failed (${response.status}).`,
+        );
+      }
 
       console.log("YOLO RESPONSE:", data);
       console.log("DETECTIONS:", data.detections);
 
       setResult(data);
 
+      updateNotificationStatus(data.alert);
       if (data.alert?.required) {
-        setMunicipalityStatus("sent");
         const alertKey = `${data.filename}-${data.plastic_count}-${data.severity}`;
         if (lastAlertRef.current !== alertKey) {
           lastAlertRef.current = alertKey;
-          speakAlert(`AquaGuard alert. ${data.plastic_count} plastic waste objects detected. Municipality notification sent.`);
+          const notificationAccepted = Object.values(
+            data.alert.notification ?? {},
+          ).some((channel) => channel.status === "accepted");
+          speakAlert(
+            notificationAccepted
+              ? `AquaGuard alert. ${data.plastic_count} plastic waste objects detected. The notification provider accepted the request. Delivery is not confirmed.`
+              : `AquaGuard alert. ${data.plastic_count} plastic waste objects detected. Notification setup or delivery needs attention.`,
+          );
         }
-      } else {
-        setMunicipalityStatus("standby");
       }
 
       if (data.status === "success") {
@@ -157,9 +408,70 @@ function App() {
 
       setResult({
         status: "error",
-        message: "Backend connection failed.",
+        message: error.message || "Image detection failed.",
         detections: [],
       });
+    } finally {
+      setLoading(false);
+    }
+  };
+  const handleVideoUpload = async (videoFile) => {
+    if (!videoFile) return;
+
+    setLoading(true);
+    setVideoResult(null);
+    setVideoError("");
+
+    const formData = new FormData();
+    formData.append("file", videoFile);
+
+    try {
+      const response = await fetch(
+        `${API}/api/detect-video`,
+        {
+          method: "POST",
+          body: formData,
+        }
+      );
+
+      const responseBody = await response.text();
+      let data;
+      try {
+        data = responseBody ? JSON.parse(responseBody) : {};
+      } catch {
+        if (!response.ok) {
+          throw new Error(
+            `Video detection failed (${response.status}): ${
+              responseBody || response.statusText
+            }`,
+          );
+        }
+        throw new Error("The backend returned an invalid video response.");
+      }
+      if (!response.ok) {
+        throw new Error(data.detail || `Video detection failed (${response.status}).`);
+      }
+
+      setVideoResult(data);
+      updateNotificationStatus(data.alert);
+      if (data.alert?.required) {
+        const alertKey = `video-${videoFile.name}-${data.total_plastic_detections}-${data.severity}`;
+        if (lastAlertRef.current !== alertKey) {
+          lastAlertRef.current = alertKey;
+          const notificationAccepted = Object.values(
+            data.alert.notification ?? {},
+          ).some((channel) => channel.status === "accepted");
+          speakAlert(
+            notificationAccepted
+              ? `AquaGuard alert. ${data.total_plastic_detections} plastic detections found in the video. The notification provider accepted the request. Delivery is not confirmed.`
+              : `AquaGuard alert. ${data.total_plastic_detections} plastic detections found in the video. Notification delivery needs attention.`,
+          );
+        }
+      }
+
+    } catch (error) {
+      console.error("Video detection error:", error);
+      setVideoError(error.message || "Video detection failed.");
     } finally {
       setLoading(false);
     }
@@ -264,13 +576,56 @@ function App() {
 
         <section className="response-strip">
           <div className="response-copy">
-            <span className="panel-label">MUNICIPALITY RESPONSE</span>
-            <h3>{municipalityStatus === "sent" ? "Alert sent to municipality" : "Ready for municipality alert"}</h3>
-            <p>{municipalityStatus === "sent" ? "The latest plastic-waste detection is queued for field action." : "Run a scan to create a response alert."}</p>
+            <span className="panel-label">ALERT NOTIFICATIONS</span>
+            <h3>
+              {municipalityStatus === "accepted"
+                ? "High-pollution alert request accepted"
+                : municipalityStatus === "failed"
+                  ? "High-pollution alert delivery failed"
+                  : municipalityStatus === "setup"
+                    ? "High pollution detected — notification setup needed"
+                    : "Monitoring for high pollution"}
+            </h3>
+            <p>
+              {municipalityStatus === "accepted"
+                ? "The notification provider accepted the request. Check your email inbox or provider delivery report to confirm delivery."
+                : municipalityStatus === "failed"
+                  ? "Check your notification provider settings and try the scan again."
+                  : municipalityStatus === "setup"
+                    ? "Configure your recipient email and SMTP credentials in the backend .env file."
+                    : "Email notifications are sent only for HIGH pollution."}
+              {notificationResults && (
+                <>
+                  {" "}
+                  {Object.entries(notificationResults)
+                    .map(([channel, outcome]) => {
+                      const detail = outcome.code
+                        ? ` (${outcome.code}: ${outcome.message})`
+                        : outcome.message
+                          ? ` (${outcome.message})`
+                          : "";
+                      return `${channel.toUpperCase()}: ${outcome.status}${detail}`;
+                    })
+                    .join(" · ")}
+                </>
+              )}
+            </p>
           </div>
           <div className={`response-status ${municipalityStatus}`}>
-            {municipalityStatus === "sent" ? <CheckCircle2 size={18} /> : <Clock3 size={18} />}
-            {municipalityStatus === "sent" ? "SENT" : "STANDBY"}
+            {municipalityStatus === "accepted" ? (
+              <CheckCircle2 size={18} />
+            ) : municipalityStatus === "failed" || municipalityStatus === "setup" ? (
+              <AlertTriangle size={18} />
+            ) : (
+              <Clock3 size={18} />
+            )}
+            {municipalityStatus === "accepted"
+              ? "ACCEPTED"
+              : municipalityStatus === "failed"
+                ? "FAILED"
+                : municipalityStatus === "setup"
+                  ? "SETUP NEEDED"
+                  : "STANDBY"}
           </div>
           <button className="voice-toggle" onClick={() => setVoiceEnabled((enabled) => !enabled)}>
             {voiceEnabled ? "Voice alerts on" : "Voice alerts off"}
@@ -428,9 +783,139 @@ function App() {
                 {loading
                   ? "Running YOLO..."
                   : "Run AI Detection"}
-              </button>
+                            </button>
 
             </div>
+
+
+            {/* VIDEO UPLOAD */}
+            <div className="upload-box">
+
+              <Upload size={42} />
+
+              <h3>Upload water-body video</h3>
+
+              <p>
+                Select a video to detect floating plastic frame-by-frame.
+              </p>
+
+              <input
+                type="file"
+                accept="video/*"
+                onChange={(e) => {
+                  setVideoError("");
+                  setVideoResult(null);
+                  const videoFile = e.target.files?.[0];
+
+                  if (videoFile) {
+                    handleVideoUpload(videoFile);
+                  }
+                }}
+              />
+
+              {loading && (
+                <p className="selected-file">
+                  Uploading video and analyzing every frame... Please wait.
+                </p>
+              )}
+
+              {videoError && (
+                <p className="camera-error" role="alert">
+                  {videoError}
+                </p>
+              )}
+
+              {videoResult && (
+                <div className="selected-file">
+                  <p>
+                    Frames Processed:{" "}
+                    {videoResult.frames_processed}
+                  </p>
+
+                  <p>
+                    Plastic Detections:{" "}
+                    {videoResult.total_plastic_detections}
+                  </p>
+
+                  <p>
+                    Camera:{" "}
+                    {videoResult.camera?.camera_id}
+                  </p>
+
+                  <p>
+                    GPS:{" "}
+                    {videoResult.camera?.latitude},{" "}
+                    {videoResult.camera?.longitude}
+                  </p>
+                  <p>
+                    Severity:{" "}
+                    <strong>
+                      {videoResult.severity}
+                    </strong>
+                  </p>
+                  <p>
+                    Alert:{" "}
+                    <strong>
+                      {videoResult.alert?.required
+                        ? "MUNICIPALITY ALERT REQUIRED"
+                        : "No Alert Required"}
+                    </strong>
+                  </p>
+                </div>
+              )}
+
+            </div>
+
+              {videoResult && (
+  <div className="panel">
+    <div className="panel-header">
+      <div>
+        <span className="panel-label">
+          VIDEO ANALYTICS
+        </span>
+
+        <h3>Plastic Pollution Analysis</h3>
+      </div>
+
+      <Activity size={20} />
+    </div>
+
+    <div className="stats-grid">
+
+      <div className="stat-card">
+        <span>FRAMES PROCESSED</span>
+        <strong>
+          {videoResult.frames_processed}
+        </strong>
+      </div>
+
+      <div className="stat-card">
+        <span>PLASTIC DETECTIONS</span>
+        <strong>
+          {videoResult.total_plastic_detections}
+        </strong>
+      </div>
+
+      <div className="stat-card">
+        <span>SEVERITY</span>
+        <strong>
+          {videoResult.severity}
+        </strong>
+      </div>
+
+      <div className="stat-card">
+        <span>ALERT STATUS</span>
+        <strong>
+          {videoResult.alert?.required
+            ? "REQUIRED"
+            : "NORMAL"}
+        </strong>
+      </div>
+
+    </div>
+  </div>
+)}
+
 
             {/* IMAGE OUTPUT */}
             {preview && (
@@ -635,19 +1120,55 @@ function App() {
 
             <div className="camera-view">
 
-              {cameraOnline && (
-                <img
-                  className="live-camera-image"
-                  src={`${API}/api/camera?tick=${cameraTick}`}
-                  alt="Live water body camera"
-                  onError={() => setCameraOnline(false)}
-                />
+              <video
+                ref={videoRef}
+                className="live-camera-image"
+                autoPlay
+                playsInline
+                muted
+                aria-label="Live camera feed"
+              />
+              {cameraFrameSize.width > 0 && (
+                <svg
+                  className="camera-detection-overlay"
+                  viewBox={`0 0 ${cameraFrameSize.width} ${cameraFrameSize.height}`}
+                  preserveAspectRatio="xMidYMid meet"
+                  role="img"
+                  aria-label={`${cameraDetections.length} detected objects`}
+                >
+                  {cameraDetections
+                    .filter((detection) => detection.is_plastic)
+                    .map((detection, index) => {
+                      const [x1, y1, x2, y2] = detection.bbox;
+                      return (
+                        <g key={`${detection.class_name}-${index}`}>
+                          <rect
+                            x={x1}
+                            y={y1}
+                            width={x2 - x1}
+                            height={y2 - y1}
+                          />
+                          <text x={x1} y={Math.max(18, y1 - 6)}>
+                            {detection.class_name}{" "}
+                            {Math.round(detection.confidence * 100)}%
+                          </text>
+                        </g>
+                      );
+                    })}
+                </svg>
               )}
 
               <div className="camera-overlay">
                 <span className="rec-dot"></span>
-                {cameraOnline ? "LIVE / AI CAMERA 01" : "WAITING FOR CAMERA"}
+                {cameraOnline ? "LIVE / LOCAL WEBCAM" : "WAITING FOR CAMERA"}
               </div>
+              {cameraOnline && (
+                <p className="camera-detection-status" aria-live="polite">
+                  {cameraDetectionError
+                    ? cameraDetectionError
+                    : `${cameraDetections.filter((item) => item.is_plastic).length} plastic object(s) detected`}
+                </p>
+              )}
 
               {!cameraOnline && <div className="camera-center">
                 <Camera size={50} />
@@ -655,15 +1176,65 @@ function App() {
                 <p>Camera feed unavailable</p>
 
                 <small>
-                  Start the camera sender to see the latest frame here.
+                  Start the webcam to show its real-time feed here.
                 </small>
               </div>}
 
             </div>
+            <button
+              className="camera-action"
+              type="button"
+              onClick={cameraOnline ? stopCamera : startCamera}
+              disabled={cameraStarting}
+            >
+              {cameraStarting
+                ? "Starting Camera..."
+                : cameraOnline
+                  ? "Stop Camera"
+                  : "Start Camera"}
+            </button>
+            {cameraError && <p className="camera-error">{cameraError}</p>}
 
           </div>
 
         </section>
+        {/* SOURCE TRACKING MAP */}
+<section className="panel">
+  <div className="panel-header">
+    <div>
+      <span className="panel-label">
+        SOURCE TRACKING
+      </span>
+
+      <h3>Plastic Waste Hotspot Map</h3>
+    </div>
+
+    <MapPin size={20} />
+  </div>
+
+  {videoResult?.camera || environment?.gps ? (
+  <SourceTrackingMap
+    latitude={
+      videoResult?.camera?.latitude ??
+      environment?.gps?.latitude
+    }
+    longitude={
+      videoResult?.camera?.longitude ??
+      environment?.gps?.longitude
+    }
+    plasticCount={
+      videoResult?.total_plastic_detections ??
+      result?.plastic_count ??
+      history.length
+    }
+  />
+) : (
+    <div className="empty-history">
+      <MapPin size={32} />
+      <p>GPS location unavailable.</p>
+    </div>
+  )}
+</section>
 
         {/* HISTORY */}
         <section className="panel history-panel">

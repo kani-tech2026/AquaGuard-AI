@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from "react";
+import "leaflet/dist/leaflet.css";
+import { MapContainer, TileLayer, Marker, Popup } from "react-leaflet";
 import {
   Activity,
   AlertTriangle,
@@ -16,9 +18,43 @@ import {
   Thermometer,
 } from "lucide-react";
 
+
 import "./App.css";
 
-const API = "http://127.0.0.1:8001";
+const API = "http://127.0.0.1:800";
+function SourceTrackingMap({ latitude, longitude, plasticCount }) {
+  const position = [latitude, longitude];
+
+  return (
+    <div style={{ height: "420px", width: "100%", borderRadius: "16px", overflow: "hidden" }}>
+      <MapContainer
+        center={position}
+        zoom={15}
+        scrollWheelZoom={true}
+        style={{ height: "100%", width: "100%" }}
+      >
+        <TileLayer
+          attribution='&copy; OpenStreetMap contributors'
+          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+        />
+
+        <Marker position={position}>
+          <Popup>
+            <strong>AquaGuard AI</strong>
+            <br />
+            Plastic hotspot
+            <br />
+            Plastic count: {plasticCount}
+            <br />
+            Latitude: {latitude}
+            <br />
+            Longitude: {longitude}
+          </Popup>
+        </Marker>
+      </MapContainer>
+    </div>
+  );
+}
 
 function App() {
   // ============================================================

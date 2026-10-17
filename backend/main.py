@@ -1,13 +1,20 @@
 from pathlib import Path
+import logging
+import os
 
-from fastapi import FastAPI, UploadFile, File
+import cv2
+import numpy as np
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from detection.detector import AquaGuardDetector
+from detection.detector import AquaGuardDetector, is_plastic_class
 from database.db import init_db, get_detections, add_detection
 from gps.gps import gps
 from sensors.water_sensor import water_sensor
+from backend.sms_service import get_notification_status, notify_high_pollution
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -95,6 +102,20 @@ def calculate_severity(plastic_count):
         return "CRITICAL"
 
 
+def _notification_error_message(error):
+    message = str(error)
+    for setting in (
+        "ALERT_PHONE_NUMBER",
+        "MSG91_AUTHKEY",
+        "TWILIO_ACCOUNT_SID",
+        "TWILIO_AUTH_TOKEN",
+    ):
+        secret = os.getenv(setting, "")
+        if secret:
+            message = message.replace(secret, "[redacted]")
+    return f"{type(error).__name__}: {message or 'No error details.'}"
+
+
 # ============================================================
 # STATS
 # ============================================================
@@ -160,16 +181,7 @@ def detection_history():
 
         class_name = row[1]
 
-        is_plastic = str(class_name).lower() in [
-            "floater",
-            "plastic",
-            "plastic_waste",
-            "plastic_bottle",
-            "plastic_bag",
-            "plastic_container",
-            "plastic_cup",
-            "plastic_wrapper"
-        ]
+        is_plastic = is_plastic_class(class_name)
 
         output.append({
 
@@ -351,9 +363,17 @@ async def detect(
     # YOLO prediction
     # --------------------------------------------------------
 
-    detections = detector.predict(
-        str(upload_path)
-    )
+    try:
+        detections = detector.predict(str(upload_path))
+    except Exception as error:
+        logger.exception("Image inference failed for %s.", safe_filename)
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Image inference failed ({type(error).__name__}). "
+                "Check the backend terminal for details."
+            )
+        ) from error
 
     # --------------------------------------------------------
     # GPS + Water Data
@@ -457,8 +477,16 @@ async def detect(
     # Alert Status
     # --------------------------------------------------------
 
-    alert_required = (
-        plastic_count > 0
+    alert_required = severity in {"HIGH", "CRITICAL"}
+    notification = (
+        notify_high_pollution(
+            severity,
+            plastic_count,
+            location["latitude"],
+            location["longitude"],
+        )
+        if alert_required
+        else None
     )
 
     # --------------------------------------------------------
@@ -509,13 +537,10 @@ async def detect(
                 else None
             ),
 
-            "status": (
-                "pending"
-                if alert_required
-                else "not_required"
-            ),
+            "status": get_notification_status(notification),
 
-            "recipients": 2
+            "recipients": 1 if alert_required else 0,
+            "notification": notification,
         },
 
         # Location
@@ -527,3 +552,175 @@ async def detect(
         # Individual objects
         "detections": detections
     }
+
+
+@app.post("/api/detect-frame")
+async def detect_frame(file: UploadFile = File(...)):
+    global detector
+
+    contents = await file.read()
+    frame = cv2.imdecode(
+        np.frombuffer(contents, dtype=np.uint8),
+        cv2.IMREAD_COLOR
+    )
+    if frame is None:
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded camera frame is not a valid image."
+        )
+
+    if detector is None:
+        try:
+            detector = AquaGuardDetector()
+        except FileNotFoundError as error:
+            raise HTTPException(
+                status_code=503,
+                detail="YOLO model best.pt is not available."
+            ) from error
+
+    detections = detector.predict(frame)
+    return {
+        "status": "success",
+        "plastic_count": sum(
+            detection["is_plastic"] for detection in detections
+        ),
+        "frame_size": {
+            "width": int(frame.shape[1]),
+            "height": int(frame.shape[0])
+        },
+        "detections": detections
+    }
+
+
+# ============================================================
+# VIDEO DETECTION
+# ============================================================
+
+@app.post("/api/detect-video")
+async def detect_video(
+    file: UploadFile = File(...),
+    camera_id: str = "CAM_01",
+    latitude: float = 10.38,
+    longitude: float = 78.82,
+    altitude: float = 100.0
+):
+
+    global detector
+
+    upload_dir = Path("uploads")
+    upload_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    safe_filename = Path(file.filename or "upload.mp4").name
+    upload_path = upload_dir / safe_filename
+
+    with open(upload_path, "wb") as buffer:
+        contents = await file.read()
+        if not contents:
+            raise HTTPException(
+                status_code=400,
+                detail="The uploaded video is empty."
+            )
+        buffer.write(contents)
+
+    if detector is None:
+        try:
+            detector = AquaGuardDetector()
+        except FileNotFoundError as error:
+            raise HTTPException(
+                status_code=503,
+                detail="YOLO model best.pt is not available."
+            ) from error
+
+    try:
+        result = detector.predict_video(str(upload_path))
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        ) from error
+    except Exception as error:
+        logger.exception("Video inference failed for %s.", safe_filename)
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Video inference failed ({type(error).__name__}). "
+                "Check the backend terminal for details."
+            )
+        ) from error
+
+    result["status"] = "success"
+
+    result["camera"] = {
+        "camera_id": camera_id,
+        "latitude": latitude,
+        "longitude": longitude,
+        "altitude": altitude
+    }
+
+    # Calculate video pollution severity
+
+    total_detections = result.get(
+        "total_plastic_detections",
+        0
+    )
+
+    if total_detections >= 150:
+        video_severity = "HIGH"
+
+    elif total_detections >= 75:
+        video_severity = "MEDIUM"
+
+    elif total_detections > 0:
+        video_severity = "LOW"
+
+    else:
+        video_severity = "NONE"
+
+    result["severity"] = video_severity
+
+    alert_required = video_severity == "HIGH"
+    notification = None
+    if alert_required:
+        try:
+            notification = notify_high_pollution(
+                video_severity,
+                total_detections,
+                latitude,
+                longitude,
+            )
+        except Exception as error:
+            logger.exception(
+                "Video notification dispatch failed for %s.",
+                safe_filename,
+            )
+            notification = {
+                "dispatch": {
+                    "status": "failed",
+                    "message": (
+                        "Video was analyzed, but notification dispatch failed: "
+                        f"{_notification_error_message(error)}"
+                    ),
+                }
+            }
+
+    result["alert"] = {
+        "required": alert_required,
+
+        "type": (
+            "PLASTIC_WASTE"
+            if alert_required
+            else None
+        ),
+
+        "status": get_notification_status(notification),
+
+        "recipients": 1 if alert_required else 0,
+        "notification": notification,
+    }
+
+    result["focus"] = "plastic"
+
+    return result
